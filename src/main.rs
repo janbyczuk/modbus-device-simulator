@@ -8,7 +8,8 @@
 use mbsim::{
     cli::Args,
     server,
-    device::Device,
+    device::DeviceManager,
+    config::Config,
 };
 use clap::Parser;
 use anyhow::{Result, Context};
@@ -27,13 +28,18 @@ async fn main() -> Result<()> {
 
     println!("Starting Modbus server on: {}", sock_addr);
 
-    let script = fs::read_to_string(args.script)?;
+    // Load YAML configuration
+    let yaml = fs::read_to_string(&args.config)
+        .with_context(|| format!("Failed to read config file: {}", args.config))?;
 
-    // Create the virtual device
-    let device = Device::new(&script)?;
+    let config = Config::from_yaml(&yaml)
+        .with_context(|| "Failed to parse YAML configuration")?;
+
+    // Create the device manager from configuration
+    let device_manager = DeviceManager::from_config(config);
 
     // Start the server task
-    tokio::spawn(server::run(sock_addr, device));
+    tokio::spawn(server::run(sock_addr, device_manager));
     // Wait for user exit
     tokio::signal::ctrl_c().await?;
 

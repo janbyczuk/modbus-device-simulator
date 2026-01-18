@@ -7,3 +7,4 @@
 pub mod cli;
 pub mod server;
 pub mod device;
+pub mod config;

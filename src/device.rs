@@ -5,199 +5,330 @@
 // @date Nov 26 2022
 //
 
-use mlua::{prelude::*, Function};
+use crate::config::{Config, DeviceConfig, Step};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use thiserror::Error;
-
-use std::io;
 
 #[derive(Debug, Error)]
 pub enum DeviceError {
-    #[error("Failed to initialize device")]
-    IoError(#[from] io::Error),
-    #[error("Failed to load script")]
-    ScriptError(#[from] LuaError),
+    #[error("Device with slave_id {0} not found")]
+    DeviceNotFound(u8),
+    #[error("Register address {0} not found")]
+    RegisterNotFound(u16),
 }
 
-/// Virtual device that uses a scripting runtime
-pub struct Device {
-    lua: Lua,
+/// In-memory register storage for a single device
+#[derive(Debug, Clone)]
+struct RegisterStorage {
+    holding_registers: HashMap<u16, u16>,
+    on_write_triggers: HashMap<u16, Vec<Step>>,
 }
 
-impl Device {
-    pub fn new(script: &str) -> Result<Self, DeviceError> {
-        // let script = fs::read_to_string(script)?;
-        let lua = Lua::new();
-        lua.load(script).exec().map_err(|e| DeviceError::ScriptError(e))?;
+impl RegisterStorage {
+    fn new(device_config: &DeviceConfig) -> Self {
+        let mut holding_registers = HashMap::new();
+        let mut on_write_triggers = HashMap::new();
 
-        Ok(Device {
-            lua,
-        })
+        for reg in &device_config.holding_registers {
+            holding_registers.insert(reg.address, reg.initial_value);
+            if let Some(ref on_write) = reg.on_write {
+                on_write_triggers.insert(reg.address, on_write.sequence.clone());
+            }
+        }
+
+        Self {
+            holding_registers,
+            on_write_triggers,
+        }
     }
 
-    /// Read input registers (read-only integer) from the virtual device
-    pub fn read_input_registers(&self, address: u16, count: u16) -> Result<Vec<u16>, DeviceError> {
-        let read_input_registers_fn: Function = self.lua.globals().get("ReadInputRegisters")?;
-        let regs: Vec<u16> = read_input_registers_fn.call((address, count))?;
-
-        Ok(regs)
+    fn read_holding_register(&self, address: u16) -> Option<u16> {
+        self.holding_registers.get(&address).copied()
     }
 
-    /// Read discrete inputs (read-only boolean) from the virtual device
-    pub fn read_discrete_inputs(&self, address: u16, count: u16) -> Result<Vec<bool>, DeviceError> {
-        let read_discrete_inputs_fn: Function = self.lua.globals().get("ReadDiscreteInputs")?;
-        let inputs: Vec<bool> = read_discrete_inputs_fn.call((address, count))?;
-
-        Ok(inputs)
+    fn write_holding_register(&mut self, address: u16, value: u16) {
+        self.holding_registers.insert(address, value);
     }
 
-    /// Read coils (read-write) from the virtual device
-    pub fn read_coils(&self, address: u16, count: u16) -> Result<Vec<bool>, DeviceError> {
-        let read_coils_fn: Function = self.lua.globals().get("ReadCoils")?;
-        let coils: Vec<bool> = read_coils_fn.call((address, count))?;
+    fn get_on_write_sequence(&self, address: u16) -> Option<Vec<Step>> {
+        self.on_write_triggers.get(&address).cloned()
+    }
+}
 
-        Ok(coils)
+/// Virtual device manager supporting multiple devices
+pub struct DeviceManager {
+    devices: HashMap<u8, Arc<RwLock<RegisterStorage>>>,
+}
+
+impl DeviceManager {
+    /// Create device manager from YAML configuration
+    pub fn from_config(config: Config) -> Self {
+        let mut devices = HashMap::new();
+
+        for device_config in config.devices {
+            let storage = RegisterStorage::new(&device_config);
+            devices.insert(device_config.slave_id, Arc::new(RwLock::new(storage)));
+        }
+
+        Self { devices }
     }
 
-    /// Write coils (read-write) from the virtual device
-    pub fn write_coils(&self, address: u16, values: Vec<bool>) -> Result<(u16, u16), DeviceError> {
-        let write_coils_fn: Function = self.lua.globals().get("WriteCoils")?;
-        let res: Vec<u16> = write_coils_fn.call((address, values))?;
-
-        Ok((res[0], res[1]))
+    /// Get device by slave_id
+    fn get_device(&self, slave_id: u8) -> Result<Arc<RwLock<RegisterStorage>>, DeviceError> {
+        self.devices
+            .get(&slave_id)
+            .cloned()
+            .ok_or(DeviceError::DeviceNotFound(slave_id))
     }
 
-    /// Read holding registers (read-write) from the virtual device
-    pub fn read_holding_registers(&self, address: u16, count: u16) -> Result<Vec<u16>, DeviceError> {
-        let read_holding_registers_fn: Function = self.lua.globals().get("ReadHoldingRegisters")?;
-        let regs: Vec<u16> = read_holding_registers_fn.call((address, count))?;
-        Ok(regs)
+    /// Read holding registers from a device
+    pub async fn read_holding_registers(
+        &self,
+        slave_id: u8,
+        address: u16,
+        count: u16,
+    ) -> Result<Vec<u16>, DeviceError> {
+        let device = self.get_device(slave_id)?;
+        let storage = device.read().await;
+
+        let mut result = Vec::new();
+        for i in 0..count {
+            let addr = address.wrapping_add(i);
+            result.push(storage.read_holding_register(addr).unwrap_or(0));
+        }
+
+        Ok(result)
     }
 
-    /// Write holding registers (read-write) from the virtual device
-    pub fn write_holding_registers(&self, address: u16, values: Vec<u16>) -> Result<(u16, u16), DeviceError> {
-        let write_holding_registers_fn: Function = self.lua.globals().get("WriteHoldingRegisters")?;
-        let res: Vec<u16> = write_holding_registers_fn.call((address, values))?;
+    /// Write holding registers to a device and trigger sequences
+    pub async fn write_holding_registers(
+        &self,
+        slave_id: u8,
+        address: u16,
+        values: Vec<u16>,
+    ) -> Result<(u16, u16), DeviceError> {
+        let device = self.get_device(slave_id)?;
+        let count = values.len() as u16;
 
-        Ok((res[0], res[1]))
+        // Write values and collect sequences to trigger
+        let sequences_to_run = {
+            let mut storage = device.write().await;
+            let mut sequences = Vec::new();
+
+            for (i, &value) in values.iter().enumerate() {
+                let addr = address.wrapping_add(i as u16);
+                storage.write_holding_register(addr, value);
+
+                // Check if this register has an on_write trigger
+                if let Some(sequence) = storage.get_on_write_sequence(addr) {
+                    sequences.push(sequence);
+                }
+            }
+
+            sequences
+        };
+
+        // Spawn async tasks for each sequence
+        for sequence in sequences_to_run {
+            let device_clone = device.clone();
+            tokio::spawn(async move {
+                execute_sequence(device_clone, sequence).await;
+            });
+        }
+
+        Ok((address, count))
     }
 
+    // Placeholder methods for other Modbus functions
+    pub async fn read_input_registers(
+        &self,
+        _slave_id: u8,
+        _address: u16,
+        count: u16,
+    ) -> Result<Vec<u16>, DeviceError> {
+        // Return zeros for input registers (not implemented in config)
+        Ok(vec![0; count as usize])
+    }
+
+    pub async fn read_discrete_inputs(
+        &self,
+        _slave_id: u8,
+        _address: u16,
+        count: u16,
+    ) -> Result<Vec<bool>, DeviceError> {
+        // Return false for discrete inputs (not implemented in config)
+        Ok(vec![false; count as usize])
+    }
+
+    pub async fn read_coils(
+        &self,
+        _slave_id: u8,
+        _address: u16,
+        count: u16,
+    ) -> Result<Vec<bool>, DeviceError> {
+        // Return false for coils (not implemented in config)
+        Ok(vec![false; count as usize])
+    }
+
+    pub async fn write_coils(
+        &self,
+        _slave_id: u8,
+        address: u16,
+        values: Vec<bool>,
+    ) -> Result<(u16, u16), DeviceError> {
+        // Not implemented in config, just return success
+        Ok((address, values.len() as u16))
+    }
+}
+
+/// Execute a sequence of steps asynchronously
+async fn execute_sequence(device: Arc<RwLock<RegisterStorage>>, steps: Vec<Step>) {
+    for step in steps {
+        match step {
+            Step::Set { address, value } => {
+                let mut storage = device.write().await;
+                storage.write_holding_register(address, value);
+            }
+            Step::ForMs {
+                address,
+                value,
+                duration_ms,
+            } => {
+                // Set the value
+                {
+                    let mut storage = device.write().await;
+                    storage.write_holding_register(address, value);
+                }
+                // Wait for the duration
+                tokio::time::sleep(tokio::time::Duration::from_millis(duration_ms)).await;
+            }
+            Step::WaitMs { duration_ms } => {
+                tokio::time::sleep(tokio::time::Duration::from_millis(duration_ms)).await;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
-    #[test]
-    fn load_device_from_script() {
-        let script = r#"
-            foo = 1
-        "#;
-        let device = Device::new(script);
-        assert!(device.is_ok());
+    #[tokio::test]
+    async fn test_device_manager_from_config() {
+        let yaml = r#"
+devices:
+  - slave_id: 1
+    holding_registers:
+      - address: 0
+        initial_value: 100
+      - address: 1
+        initial_value: 200
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        let manager = DeviceManager::from_config(config);
+
+        let regs = manager.read_holding_registers(1, 0, 2).await.unwrap();
+        assert_eq!(regs, vec![100, 200]);
     }
 
-    #[test]
-    fn read_input_registers() {
-        let script = r#"
-            function ReadInputRegisters(addr, cnt)
-                return {0, 1, 2}
-            end
-        "#;
+    #[tokio::test]
+    async fn test_write_holding_registers() {
+        let yaml = r#"
+devices:
+  - slave_id: 1
+    holding_registers:
+      - address: 0
+        initial_value: 0
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        let manager = DeviceManager::from_config(config);
 
-        let device = Device::new(script).unwrap();
-        let regs = device.read_input_registers(0, 10).unwrap();
+        manager
+            .write_holding_registers(1, 0, vec![42])
+            .await
+            .unwrap();
 
-        assert_eq!(regs, vec![0, 1, 2]);
+        let regs = manager.read_holding_registers(1, 0, 1).await.unwrap();
+        assert_eq!(regs, vec![42]);
     }
 
-    #[test]
-    fn read_discrete_inputs() {
-        let script = r#"
-            function ReadDiscreteInputs(addr, cnt)
-                return {0, 1, 1}
-            end
-        "#;
+    #[tokio::test]
+    async fn test_sequence_execution() {
+        let yaml = r#"
+devices:
+  - slave_id: 1
+    holding_registers:
+      - address: 0
+        initial_value: 0
+        on_write:
+          sequence:
+            - action: set
+              address: 1
+              value: 100
+            - action: wait_ms
+              duration_ms: 10
+            - action: set
+              address: 2
+              value: 200
+      - address: 1
+        initial_value: 0
+      - address: 2
+        initial_value: 0
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        let manager = DeviceManager::from_config(config);
 
-        let device = Device::new(script).unwrap();
-        let regs = device.read_discrete_inputs(0, 10).unwrap();
+        // Write to address 0 to trigger sequence
+        manager
+            .write_holding_registers(1, 0, vec![1])
+            .await
+            .unwrap();
 
-        assert_eq!(regs, vec![true, true, true]);
+        // Give sequence time to execute
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Check that sequence executed
+        let regs = manager.read_holding_registers(1, 1, 2).await.unwrap();
+        assert_eq!(regs, vec![100, 200]);
     }
 
-    #[test]
-    fn read_coils() {
-        let script = r#"
-            function ReadCoils(addr, cnt)
-                return {false, true, true}
-            end
-        "#;
+    #[tokio::test]
+    async fn test_multiple_devices() {
+        let yaml = r#"
+devices:
+  - slave_id: 1
+    holding_registers:
+      - address: 0
+        initial_value: 100
+  - slave_id: 2
+    holding_registers:
+      - address: 0
+        initial_value: 200
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        let manager = DeviceManager::from_config(config);
 
-        let device = Device::new(script).unwrap();
-        let regs = device.read_coils(0, 10).unwrap();
+        let regs1 = manager.read_holding_registers(1, 0, 1).await.unwrap();
+        let regs2 = manager.read_holding_registers(2, 0, 1).await.unwrap();
 
-        assert_eq!(regs, vec![false, true, true]);
+        assert_eq!(regs1, vec![100]);
+        assert_eq!(regs2, vec![200]);
     }
 
-    #[test]
-    fn read_write_coils() {
-        let script = r#"
-            coils = {false, false, false}
-            function WriteCoils(addr, values)
-                for i = 1,#values do
-                    coils[i] = values[i]
-                end
+    #[tokio::test]
+    async fn test_device_not_found() {
+        let yaml = r#"
+devices:
+  - slave_id: 1
+    holding_registers: []
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        let manager = DeviceManager::from_config(config);
 
-                return {addr, #values}
-            end
-            function ReadCoils(addr, cnt)
-                return coils
-            end
-        "#;
-
-        let device = Device::new(script).unwrap();
-
-        device.write_coils(0, vec![true, true, true]).ok().unwrap();
-        let regs = device.read_coils(0, 10).unwrap();
-
-        assert_eq!(regs, vec![true, true, true]);
+        let result = manager.read_holding_registers(99, 0, 1).await;
+        assert!(result.is_err());
     }
-
-    #[test]
-    fn read_holding_registers() {
-        let script = r#"
-            function ReadHoldingRegisters(addr, cnt)
-                return {0, 1, 2, 3, 4}
-            end
-        "#;
-
-        let device = Device::new(script).unwrap();
-        let regs = device.read_holding_registers(0, 5).unwrap();
-
-        assert_eq!(regs, vec![0, 1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn read_write_holding_registers() {
-        let script = r#"
-            hr = {0, 0, 0}
-            function WriteHoldingRegisters(addr, values)
-                for i = 1,#values do
-                    hr[i] = values[i]
-                end
-
-                return {addr, #values}
-            end
-            function ReadHoldingRegisters(addr, cnt)
-                return hr
-            end
-        "#;
-
-        let device = Device::new(script).unwrap();
-
-        device.write_holding_registers(0, vec![0, 1, 2]).ok().unwrap();
-        let regs = device.read_holding_registers(0, 3).unwrap();
-
-        assert_eq!(regs, vec![0, 1, 2]);
-    }
-
 }

@@ -1,0 +1,46 @@
+# Example Modbus device configuration
+devices:
+  - slave_id: 1
+    holding_registers:
+      # Simple registers with initial values
+      - address: 0
+        initial_value: 100
+      - address: 1
+        initial_value: 200
+      - address: 2
+        initial_value: 300
+      
+      # Register with on_write sequence trigger
+      - address: 100
+        initial_value: 0
+        on_write:
+          sequence:
+            # Set register 101 to 1 immediately
+            - action: set
+              address: 101
+              value: 1
+            # Wait 500ms
+            - action: wait_ms
+              duration_ms: 500
+            # Set register 102 to 50 and hold for 1 second
+            - action: for_ms
+              address: 102
+              value: 50
+              duration_ms: 1000
+            # Set register 101 back to 0
+            - action: set
+              address: 101
+              value: 0
+      
+      - address: 101
+        initial_value: 0
+      - address: 102
+        initial_value: 0
+
+  # Second device with different slave_id
+  - slave_id: 2
+    holding_registers:
+      - address: 0
+        initial_value: 1000
+      - address: 1
+        initial_value: 2000
