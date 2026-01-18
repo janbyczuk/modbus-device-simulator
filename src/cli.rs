@@ -15,7 +15,7 @@ pub struct Args {
     /// Port to use
     #[arg(short, long, default_value_t = 5502)]
     pub port: u16,
-    /// Device script
+    /// Device configuration file (YAML)
     #[arg(short, long)]
-    pub script: String
+    pub config: String
 }
