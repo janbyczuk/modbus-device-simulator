@@ -142,42 +142,51 @@ impl DeviceManager {
     }
 
     // Placeholder methods for other Modbus functions
+    // Note: These return errors for invalid slave_ids as they are not implemented in the config
     pub async fn read_input_registers(
         &self,
-        _slave_id: u8,
+        slave_id: u8,
         _address: u16,
         count: u16,
     ) -> Result<Vec<u16>, DeviceError> {
+        // Verify device exists even though we don't use it
+        let _ = self.get_device(slave_id)?;
         // Return zeros for input registers (not implemented in config)
         Ok(vec![0; count as usize])
     }
 
     pub async fn read_discrete_inputs(
         &self,
-        _slave_id: u8,
+        slave_id: u8,
         _address: u16,
         count: u16,
     ) -> Result<Vec<bool>, DeviceError> {
+        // Verify device exists even though we don't use it
+        let _ = self.get_device(slave_id)?;
         // Return false for discrete inputs (not implemented in config)
         Ok(vec![false; count as usize])
     }
 
     pub async fn read_coils(
         &self,
-        _slave_id: u8,
+        slave_id: u8,
         _address: u16,
         count: u16,
     ) -> Result<Vec<bool>, DeviceError> {
+        // Verify device exists even though we don't use it
+        let _ = self.get_device(slave_id)?;
         // Return false for coils (not implemented in config)
         Ok(vec![false; count as usize])
     }
 
     pub async fn write_coils(
         &self,
-        _slave_id: u8,
+        slave_id: u8,
         address: u16,
         values: Vec<bool>,
     ) -> Result<(u16, u16), DeviceError> {
+        // Verify device exists even though we don't use it
+        let _ = self.get_device(slave_id)?;
         // Not implemented in config, just return success
         Ok((address, values.len() as u16))
     }
@@ -329,6 +338,39 @@ devices:
         let manager = DeviceManager::from_config(config);
 
         let result = manager.read_holding_registers(99, 0, 1).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_input_registers_device_not_found() {
+        let yaml = r#"
+devices:
+  - slave_id: 1
+    holding_registers: []
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        let manager = DeviceManager::from_config(config);
+
+        // Should return error for non-existent device
+        let result = manager.read_input_registers(99, 0, 1).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_coils_device_not_found() {
+        let yaml = r#"
+devices:
+  - slave_id: 1
+    holding_registers: []
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        let manager = DeviceManager::from_config(config);
+
+        // Should return error for non-existent device
+        let result = manager.read_coils(99, 0, 1).await;
+        assert!(result.is_err());
+        
+        let result = manager.write_coils(99, 0, vec![true]).await;
         assert!(result.is_err());
     }
 }

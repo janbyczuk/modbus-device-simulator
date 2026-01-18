@@ -14,6 +14,8 @@ A YAML-configured Modbus server simulator supporting multiple devices and dynami
 
 The simulator uses YAML configuration files to define virtual Modbus devices. Each device can have multiple holding registers with optional write triggers that execute sequences of actions.
 
+**Note:** The current implementation defaults to slave_id 1 due to limitations in the tokio-modbus library's TCP server API. While the configuration supports multiple devices, the server currently only routes requests to the device with slave_id 1. This is a known limitation that would require modifications to the underlying tokio-modbus library to fully support.
+
 ### Basic Example
 
 ```yaml

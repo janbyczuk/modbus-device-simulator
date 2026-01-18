@@ -57,9 +57,13 @@ impl Service for DeviceService {
         let device_manager = self.device_manager.clone();
 
         Box::pin(async move {
-            // Extract slave_id from request (if available in the protocol layer)
-            // For now, we'll use a default slave_id of 1
-            // In a proper implementation, this would come from the Modbus request header
+            // Extract slave_id from request
+            // NOTE: The tokio-modbus library doesn't expose slave_id at the TCP server Service level.
+            // The slave_id is handled at the PDU layer and not accessible here.
+            // For now, we default to slave_id 1. To support multiple devices properly,
+            // this would require modifications to the tokio-modbus library or implementing
+            // a custom server that handles the slave_id at a lower level.
+            // See: https://github.com/slowtec/tokio-modbus/issues
             let slave_id = 1u8;
 
             let res = match req {
