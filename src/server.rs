@@ -20,6 +20,10 @@ use tokio_modbus::{
     server::{self, Service, NewService},
 };
 
+// Default slave ID to use when not available from the protocol layer
+// NOTE: tokio-modbus TCP server doesn't expose slave_id at the Service level
+const DEFAULT_SLAVE_ID: u8 = 1;
+
 /// Handles spawning new service handlers for modbus clients
 struct ServiceSpawner {
     device_manager: Arc<DeviceManager>,
@@ -60,11 +64,11 @@ impl Service for DeviceService {
             // Extract slave_id from request
             // NOTE: The tokio-modbus library doesn't expose slave_id at the TCP server Service level.
             // The slave_id is handled at the PDU layer and not accessible here.
-            // For now, we default to slave_id 1. To support multiple devices properly,
+            // For now, we default to DEFAULT_SLAVE_ID. To support multiple devices properly,
             // this would require modifications to the tokio-modbus library or implementing
             // a custom server that handles the slave_id at a lower level.
             // See: https://github.com/slowtec/tokio-modbus/issues
-            let slave_id = 1u8;
+            let slave_id = DEFAULT_SLAVE_ID;
 
             let res = match req {
                 Request::ReadInputRegisters(addr, cnt) => {

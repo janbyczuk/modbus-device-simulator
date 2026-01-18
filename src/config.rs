@@ -8,9 +8,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
+// Valid Modbus slave ID range
+const MIN_SLAVE_ID: u8 = 1;
+const MAX_SLAVE_ID: u8 = 254;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("Invalid slave_id: {0}. Must be in range 1..=254")]
+    #[error("Invalid slave_id: {0}. Must be in range {MIN_SLAVE_ID}..={MAX_SLAVE_ID}")]
     InvalidSlaveId(u8),
     #[error("Duplicate holding register address {0} for device {1}")]
     DuplicateAddress(u16, u8),
@@ -69,7 +73,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         for device in &self.devices {
             // Validate slave_id range
-            if device.slave_id == 0 || device.slave_id > 254 {
+            if device.slave_id < MIN_SLAVE_ID || device.slave_id > MAX_SLAVE_ID {
                 return Err(ConfigError::InvalidSlaveId(device.slave_id));
             }
 
